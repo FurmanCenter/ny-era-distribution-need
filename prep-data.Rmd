@@ -1,0 +1,244 @@
+---
+title: "Prepare data for analysis"
+subtitle: "NYU Furman Center"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    code_folding: show
+---
+
+
+The analysis presented here appears in this blog post:
+
+[Rental Assistance Need in Five of New York’s Mid-Sized Cities](https://furmancenter.org/thestoop/entry/rental-assistance-need-in-five-of-new-yorks-mid-sized-cities)
+
+The dataset prepared here is used in this [separate analysis](https://FurmanCenter.github.io/ny-era-distribution-need/analysis_moe-no_rep-100.html).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+```
+
+```{r load-packages-set-options}
+library(tidyverse) # general data manipulation and graphing
+library(scales) # number formatting
+library(srvyr) # survey functions
+library(gt) # making tables
+
+# No scientific notation in outputs
+options(scipen = 999)
+```
+
+
+```{r r-sources}
+# Script to prepare BLS data
+source("bls-emp-ny.R")
+
+# Script to prepare renter adjustment factor
+source("renter_unemp_adj.R")
+
+# Load function ind_to_bls() to recode IPUMS ind codes to BLS ones we're using
+source("R/ind_to_bls.R")
+```
+
+### BLS Unemployment Data
+
+We get data from the US Bureau of Labor Statistics (BLS) Current Employment Statistics (CES) state/metro database for all of New York by industry group. In general renters experience higher unemployment rates than homeowners, even within the same industry, and since we are focusing on renters in this analysis we need to adjust for this difference. To achieve this we calculate renter adjustment factors by industry for the unemployment rates in NY and apply those to the BLS CES data to arrive at our final numbers for the percent of job loss by industry between November 2019 and November 2020.
+
+```{r}
+renter_unemp_data <- read_rds(path("data", "unemp_renter_adj.rds"))
+
+bls_ind_job_loss <- read_rds("data/bls_emp_ny.rds") %>% 
+  rename(ind_group_bls = supersector_industry) %>% 
+  left_join(renter_unemp_data, by = "ind_group_bls") %>% 
+  transmute(
+    ind_group_bls,
+    bls_ind_name,
+    emp_2019_11,
+    emp_2020_11,
+    unemp_renter_adj,
+    # In a previous version of the analysis, mining and construction had a
+    # slightly positive change in unemployment (<1%) (because we're comparing
+    # Feb to Aug and using non-seasonally adjusted data), and so we set these to
+    # 0 job loss. his is no longer an issue for Nov2019-2020. (In this step we
+    # also flip the sign so this is the amount of loss), then apply the
+    # adjustment factor to account for higher unemployment rates among renters)
+    job_loss_pct_unadj = if_else(unemp_chg_pct > 0, 0, abs(unemp_chg_pct)),
+    job_loss_pct = job_loss_pct_unadj*unemp_renter_adj
+    )
+
+gt(bls_ind_job_loss) %>% 
+  cols_label(
+    bls_ind_name = "Industry",
+    emp_2019_11 = md("Employed Persons <br>(November, 2019)"),
+    emp_2020_11 = md("Employed Persons <br>(November, 2020)"),
+    unemp_renter_adj = "Renter Adjustment",
+    job_loss_pct_unadj = "Renter Job Loss Percent (unadjusted)",
+    job_loss_pct = "Renter Job Loss Percent (adjusted)"
+  ) %>% 
+  fmt_number(columns = starts_with("emp"), decimal = 0) %>% 
+  fmt_number(columns = "unemp_renter_adj", decimal = 2) %>% 
+  fmt_percent(columns = contains("pct"), decimal = 1)
+```
+
+### HUD Area Median Income (AMI)
+
+For our parts of our analysis we restrict to only renter households with incomes below 80% of the Area Median Income (AMI). To incorporate this information we use a file that the Furman Center has prepared from [public HUD data sources](https://www.huduser.gov/portal/datasets/il.html#2018_data) that provides the 80% AMI income cutoff for households of different sizes for every metro area. We'll join this unto the IPUMS data using the county and persons columns (AMIs vary depending on the number of people in the household). 
+
+```{r hud-ami}
+hud_ami <- read_csv("data/hud-2018-ami.csv", col_types = "dddddd")
+```
+
+To incorporate the AMI data we need to assign PUMAs to counties first. Since PUMAs don't always nest within counties we use this crosswalk file created by [geocorr](http://mcdc.missouri.edu/applications/geocorr2014.html). This file is created using counts of housing units at the census block level to determine an allocation factor of PUMAs to counties (the share of a PUMA's housing units that fall within a given county). We then assign each PUMA to the county that contains the plurality of its housing units.
+
+```{r county-xwalk}
+puma_county_xwalk <- "data/geocorr_puma2010_county2010.csv" %>% 
+  read_csv(col_names = c("state", "puma", "county", "afact"), col_types = "ddd____d", skip = 2) %>% 
+  mutate(county = as.numeric(str_sub(county, -3))) %>% 
+  arrange(state, puma, desc(afact)) %>% 
+  distinct(state, puma, .keep_all = TRUE)
+```
+
+
+### IPUMS American Community Survey Microdata
+
+All data for this analysis comes from [_IPUMS USA, University of Minnesota_](https://usa.ipums.org/). To build on this analysis and/or replicate it for a different geography, you can sign up for a free account and download your own extract of the data. From the IPUMS USA page, go to _Select Data_ and choose the variables. In addition to to automatically pre-selected variables, you'll to select the following other variables: `statefip`, `puma`, `numprec`, `age`, `ind`, `inctot`, `incwage`, `hhincome`, `ownershp`, `rentgrs`, `empstat`, `unitsstr`, and `migrate1`. Then click _Change Samples_ to select the data sample you want to use (for this analysis we have used ACS 2019 1-year). Once you have all your variables and samples selected, click _View Cart_ and then _Create Extract_. The default options here are fine (format: `.csv`, structure: `Rectangular (person)`), and by default you'll download data for the whole country. You can click _Select Cases_, then `statefip` to export data for only the states you select. Once the request is complete, download the file to the `/data` folder and adjust the following section of code to reflect your file name and filter to your desired geography.
+
+```{r load-ipums}
+# Read in IPUMS USA ACS microdata, standardize the column names
+ipums_raw <- read_csv("data/ipums_acs-2019-1yr_ny.csv.gz") %>% 
+  rename_with(str_to_lower)
+```
+
+
+### Prepare Data
+
+First we join the UI claims and HUD AMI data onto the IPUMS data, and create a variety of new variables related to incomes, rents, and household members that will be used in determining eligibility of UI and assessing rental assistance need. 
+
+For unemployment insurance benefits, we also have to make some simplifying assumptions due to lack of information and eligibility based on their job, immigration status, and quarterly wages. In determining eligibility we assume each person's highest quarterly wages to simply be one quarter of their total annual wages, and then apply the eligibility criteria as defined be New York State. We start by determining eligibility and the amount of UI benefits based solely on wages for every person, and then below once job loss assumptions are incorporated we adjust these based on job losses and UI recipiency rates. 
+ 
+```{r general-calculations}
+# Create all the universal person- and household-level variables for analysis
+
+ipums_clean <- ipums_raw %>% 
+  left_join(puma_county_xwalk, by = c("statefip" = "state", "puma")) %>% 
+  mutate(persons = if_else(numprec > 8, 8, numprec)) %>% 
+  left_join(hud_ami, by = c("statefip" = "state", "county", "persons")) %>% 
+  filter(
+    # Remove group quarters population
+    gq %in% 1:2 
+  ) %>% 
+  mutate(ind_group_bls = ind_to_bls(ind)) %>% 
+  left_join(bls_ind_job_loss, by = "ind_group_bls") %>% 
+  mutate(
+    # Define cities
+
+    # These cities were selected as example for this analysis and manually
+    # matched to the relevant PUMAs. To replicate this analysis elsewhere it's
+    # recommended to use the website Geocorr referenced above to match areas
+    # of interest to PUMAs.
+    city = case_when(
+      county %in% c(5, 47, 61, 81, 85) ~ "New York City",
+      puma %in% c(3106) ~ "Yonkers",
+      puma %in% c(1205, 1206) ~ "Buffalo",
+      puma %in% c(701) ~ "Syracuse",
+      puma %in% c(2001) ~ "Albany",
+      puma %in% c(902, 903) ~ "Rochester"
+    ),
+    # We checked in the Geocorr PUMA-County crosswalk and confirmed that all of
+    # these counties are made of whole PUMAs (the pumas nest perfectly within
+    # the counties) and so we don't have to worry about weighting and allocating
+    # values. In other situations this may be an issue you need to address
+    # separately.
+    county_name = recode(
+      county,
+      # NYC boroughs/counties are treated differently, so we leave them out here
+      # `5` = "Bronx",
+      # `47` = "Brooklyn",
+      # `61` = "Manhattan",
+      # `81` = "Queens",
+      # `85` = "Staten Island",
+      `103` = "Suffolk",
+      `59` = "Nassau",
+      `119` = "Westchester",
+      `29` = "Erie",
+      `55` = "Monroe",
+      `67` = "Onondaga",
+      `71` = "Orange",
+      `87` = "Rockland",
+      `1` = "Albany",
+      `27` = "Dutchess",
+      `91` = "Saratoga",
+      `65` = "Oneida",
+      `63` = "Niagara",
+      .default = NA_character_
+    ),
+    # Set missing values
+    inc_wages = incwage %>% na_if(999999) %>% na_if(999998) %>% na_if(0),
+    
+    # Household income
+    hh_inc_nom = case_when(
+      hhincome <= 0 ~ 0,
+      hhincome == 9999999 ~ NA_real_, 
+      TRUE ~ hhincome
+    ),
+  
+    # Various renter variables. These are household level variables, and will
+    # only be used later after filtering to one row per household.
+    is_renter = (ownershp == 2),
+    gross_rent_nom = if_else(is_renter, rentgrs, NA_real_),
+    rent_burden = gross_rent_nom / (hh_inc_nom / 12),
+    is_rent_burdened = (rent_burden > 0.30),
+    is_rent_burdened_sev = (rent_burden > 0.50),
+    is_rent_burdened_mod = (is_rent_burdened) & (!is_rent_burdened_sev),
+    target_burden = if_else(is_rent_burdened, rent_burden, 0.3),
+    
+    recent_mover = migrate1 %in% 2:4,
+    
+    bldg_size = case_when(
+      unitsstr %in% 3:4 ~ "1",
+      unitsstr %in% 5:6 ~ "2-4",
+      unitsstr == 7 ~ "5-9",
+      unitsstr == 8 ~ "10-19",
+      unitsstr == 9 ~ "20-49",
+      unitsstr == 10 ~ "50+",
+      TRUE ~ "other"
+    ) %>% factor(levels = c("1","2-4","5-9","10-19","20-49","50+", "other")),
+    
+  ) %>% 
+  mutate(
+    
+    # UI benefits
+    # These are set using the NY state eligibility criteria, and will need to
+    # be adjusted for local details 
+    # NOTE: These are adjusted in a subsequent process based on job loss assumptions
+    inc_wages_qtr = inc_wages/4,
+    
+    ui_benefits_month_reg = case_when(
+      inc_wages_qtr <= 2600 ~ 0,
+      inc_wages_qtr <= 3575 ~ if_else(inc_wages_qtr/25 < 104, 104, inc_wages_qtr/25),
+      inc_wages_qtr > 3575 ~ if_else(inc_wages_qtr/26 < 143, 143, inc_wages_qtr/26),
+      TRUE ~ 0
+    ) %>% 
+      if_else(. > 504, 504, .) * 4,
+    
+    # Enhanced UI benefits
+    # We look at two possible values for this in this analysis, but others can
+    # be added/changed here
+    ui_benefits_month_extra600 = if_else(ui_benefits_month_reg > 0, 600, 0) * 4,
+    ui_benefits_month_extra300 = if_else(ui_benefits_month_reg > 0, 300, 0) * 4,
+    
+  ) %>% 
+  # Group by household and categorize households based or occupations of members
+  group_by(serial) %>% 
+  mutate(
+    # Total household income from wages
+    hh_inc_wages = sum(inc_wages, na.rm = TRUE),
+  ) %>% 
+  ungroup()
+
+write_rds(ipums_clean, path("data", "ipums_clean.rds"))
+```

@@ -1,0 +1,469 @@
+---
+title: "ERA Allocation & Rental Assistance Need"
+subtitle: "NYU Furman Center"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+params:
+  hide_moe: FALSE
+  iterations: 2
+---
+
+The analysis presented here appears in this blog post:
+
+[Rental Assistance Need and Federal ERA Allocation in New York State](https://furmancenter.org/thestoop/entry/rental-assistance-need-and-federal-era-allocation-in-new-york-state)
+
+The dataset used here is [prepared separately](https://FurmanCenter.github.io/ny-era-distribution-need/prep-data.html).
+
+The methodology and data preparation code used here is copied from previous analyses, with some updates to the underlying data. Specifically, we now use ACS 2019 1-year PUMS data (instead of 2018), and to measure employment changes we have updated for the most recent data available to use the difference between November 2019 and November 2020.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+```
+
+```{r install-packages, eval=FALSE}
+# Install required packages 
+
+pkgs <- c(
+  "tidyverse",
+  "hrbrthemes",
+  "rmarkdown",
+  "jsonlite",
+  "remotes",
+  "srvyr",
+  "knitr",
+  "furrr",
+  "gt",
+  "fs",
+)
+
+install.packages(pkgs)
+remotes::install_github("mikeasilva/blsAPI")
+```
+
+
+```{r load-packages-set-options}
+library(tidyverse) # general data manipulation and graphing
+library(scales) # number formatting
+library(srvyr) # survey functions
+library(gt) # making tables
+library(furrr) # parallel processing
+
+# Load custom theme function to help with plotting
+source("R/plot-helpers.R")
+
+# No scientific notation in outputs
+options(scipen = 999)
+
+# To deal with the random assignment of job loss and UI takeup for individuals,
+# we need to run generate the results multiple times with different random seeds
+# and then average the results. To speed this up we use {furrr} to run this in
+# parallel across multiple cores.
+plan(multiprocess)
+```
+
+```{r}
+# The total amount of emergency rental assistance funding for NY, for calculations below.
+tot_era_funds <- 1282268820.90
+```
+
+The total maximum state allocation for New York is `r scales::dollar(tot_era_funds)`. (See this [PDF document from the Treasury department](https://home.treasury.gov/system/files/136/Emergency-Rental-Assistance-Data-and-Methodology-1-11-21.pdf) for details and values for other states.)
+
+```{r load-ipums-clean}
+ipums_clean <- read_rds("data/ipums_clean.rds")
+```
+
+
+### Repeated Iterations of Analysis
+
+```{r set-iterations}
+# Number of iterations to run when compiling results
+ITERATIONS <- as.integer(params$iterations)
+
+# We manage the random number generator seed directly, so we can ignore warnings from the package that handles the parallelization 
+options(future.rng.onMisuse = "ignore")
+```
+
+In our analysis we randomly assign individuals in the data to job loss status and UI recipiency with probabilities based on the industry-specific job loss rates and the UI benefit recipiency rate. To ensure that our final results are not unduly influenced by random variation in those assignment, we repeat the analysis `r comma(ITERATIONS)` times and average the results.
+
+
+### Unemployment Insurance Recipiency Rate
+
+```{r ui-takeup-rate}
+# Assumption about % of people who lost jobs that will receive UI benefits
+UI_TAKEUP_RATE <- 0.67
+```
+
+Not every person who losses their job will receive unemployment insurance. The reasons for this include:  
+
+* income eligibility  
+* employment type eligibility  
+* immigration status  
+* administrative burden  
+* never applying  
+
+While we can test for income eligibility in the data, we have to rely on this assumption about overall take up rate to account the other factors in our analysis.
+
+For this analysis we are following the work from [The Century Foundation](https://tcf.org/content/commentary/covid-stimulus-3-0-ui-reaction) and using a UI recipiency rate of `r percent(UI_TAKEUP_RATE)` for New York State.
+
+
+### Analysis Functions
+
+There are two functions that add UI takeup and rental assistance need variables to the clean IPUMS dataset. These are part of the steps that are repeated for many iterations of the simulations. 
+
+```{r source-add-ui-and-need-vars}
+source("R/add-ui-and-need-vars.R")
+```
+
+
+This function takes a dataframe as created by the above `add_risk_vars()` function that has then been filtered to only one row per household (eg. `filter(pernum == 1)`), and summarizes the household level variables (using survey weights) of interest for a single month. 
+
+```{r survey-helpers}
+# Preset some arguments for cleaner code below
+survey_total_ci90 <- partial(survey_total, vartype = "ci", level = 0.90)
+survey_mean_ci90 <- partial(survey_mean, vartype = "ci", level = 0.90)
+```
+
+
+```{r add-moe-helper}
+# When using the {srvyr} package we get separate columns for the lower and
+# upper bounds of the confidence interval. This little helper function creates
+# a single margin of error column.
+add_moe <- function(.data) {
+  .data %>%
+  pivot_longer(is.numeric) %>% 
+  mutate(
+    value_type = case_when(
+      str_detect(name, "_low") ~ "low",
+      str_detect(name, "_upp") ~ "upp",
+      TRUE ~ "est"
+    ),
+    name = str_remove(name, "(_low|_upp)")
+  ) %>% 
+  pivot_wider(names_from = value_type, values_from = value) %>% 
+  mutate(moe_90 = upp - est) %>% 
+  select(-low, -upp) %>% 
+  pivot_longer(is.numeric, names_to = "value_type") %>% 
+  unite(name_type, name, value_type) %>% 
+  pivot_wider(names_from = name_type, values_from = value)
+}
+```
+
+### Table making helpers
+
+We create a lot of different tables to display our results, and there are a few common tasks we need to do with them all so it's helpful to separate this code out into small functions to use in each table. 
+
+It's useful to have MOE columns in the tables when drafting the write up, but for displaying the final tables it is overwhelming to have so many numbers so we also want to have versions with the MOEs hidden. We've used R Markdown's "parameters" feature to make it easy to render the document with or without MOE columns.
+
+```{r}
+# Hide margin of error columns in tables?
+HIDE_MOE <- as.logical(params$hide_moe)
+```
+
+```{r hide-cols-list-helper}
+# Annoyingly, you can't hide the col labels and have spanners, so we just make a
+# list of all the column names and set the label to "" and plug this into
+# cols_label(.list = hide_cls_list(.data))
+hide_cols_list <- function(.data) {
+  .data %>% 
+  select(is.numeric) %>% 
+  names() %>% 
+  {set_names(rep("", length(.)), .)} %>% 
+  as.list()
+}
+```
+
+```{r hide-moe-cols-helper}
+# {gt} has a useful function for hiding columns, so we just make a little
+# helper so we can show/hide based on a boolean defined above.
+
+hide_moe_cols <- function(.data, hide_moe = FALSE) {
+  if (hide_moe) {
+    cols_hide(.data, ends_with("_moe_90"))
+  } else {
+    .data
+  }
+}
+```
+
+---
+
+```{r}
+# Population
+
+summarise_pop <- function(.data, .geo) {
+  .data %>% 
+    as_survey_design(weights = perwt) %>% 
+    group_by({{.geo}}) %>%
+    summarise(pop_num = survey_total_ci90(1)) %>% 
+    ungroup()
+}
+
+data_state_pop <- ipums_clean %>%
+  mutate(city = "NY State") %>% 
+  summarise_pop(city) %>% 
+  add_moe() %>% 
+  transmute(
+    nys_pop_num_est = pop_num_est,
+    nys_pop_num_moe_90 = pop_num_moe_90,
+    nys_era_funds_num_est = tot_era_funds,
+    nys_era_funds_num_moe_90 = 0
+  )
+
+
+pop_nys_calc <- function(.data) {
+  .data %>% 
+    mutate(
+      pop_pct_est = pop_num_est / nys_pop_num_est, 
+      pop_pct_moe_90 = tidycensus::moe_prop(pop_num_est, nys_pop_num_est, 
+                                            pop_num_moe_90, nys_pop_num_moe_90),
+      era_funds_num_est = (pop_pct_est*0.45)*nys_era_funds_num_est,
+      era_funds_num_moe_90 = tidycensus::moe_product(pop_pct_est*0.45, nys_era_funds_num_est,
+                                                     pop_pct_moe_90*0.45, nys_era_funds_num_moe_90)
+    )
+}
+
+data_city_pop <- ipums_clean %>%
+  filter(!is.na(city)) %>% 
+  summarise_pop(city) %>% 
+  add_moe() %>% 
+  mutate(type = "city_pop") %>% 
+  bind_cols(data_state_pop) %>% 
+  pop_nys_calc() %>% 
+  mutate(type = "City") %>% 
+  select(
+    type,
+    geo = city, 
+    starts_with("pop_num"),
+    starts_with("pop_pct"),
+    starts_with("era_funds_num")
+  )
+
+data_county_pop <- ipums_clean %>%
+  filter(!is.na(county_name)) %>% 
+  summarise_pop(county_name) %>% 
+  add_moe() %>% 
+  mutate(type = "county_pop") %>% 
+  bind_cols(data_state_pop) %>% 
+  pop_nys_calc() %>% 
+  mutate(type = "County") %>% 
+  select(
+    type,
+    geo = county_name, 
+    starts_with("pop_num"),
+    starts_with("pop_pct"),
+    starts_with("era_funds_num")
+  )
+
+
+all_pop_table <- bind_rows(
+  data_city_pop, 
+  data_county_pop,
+  data_state_pop %>% 
+    rename_with(~str_remove(., "^nys_")) %>% 
+    mutate(type = "state", geo = "New York State")
+)
+```
+
+
+```{r}
+# Households
+
+summarise_hhs <- function(.data, .geo) {
+  .data %>% 
+    filter(
+      pernum == 1, # keep only one row per household
+      is_renter # keep only renters
+    ) %>% 
+    as_survey_design(weights = hhwt) %>% 
+    group_by({{.geo}}) %>%
+    summarise(
+      renter_hhs_num = survey_total_ci90(1),
+      renter_hhs_lost_wages_num = survey_total_ci90(hh_any_risk, na.rm = TRUE),
+      renter_need_ui300_num = survey_total_ci90(risk_rent_need_ui_all300, na.rm = TRUE)
+    ) %>% 
+    ungroup()
+}
+
+prep_hhs <- function(seed, .data) {
+  set.seed(seed)
+  
+  data_w_need <- .data %>% 
+    mutate(risk_group = runif(n()) < job_loss_pct) %>% 
+    add_ui_takeup(UI_TAKEUP_RATE) %>% 
+    add_need_vars()
+  
+  data_state_hhs <- data_w_need %>%
+    mutate(state = "ny") %>% 
+    summarise_hhs(state) %>% 
+    mutate(type = "state_hhs")
+  
+  data_city_hhs <- data_w_need %>%
+    filter(!is.na(city)) %>% 
+    summarise_hhs(city) %>% 
+    mutate(type = "city_hhs")
+  
+  data_county_hhs <- data_w_need %>%
+    filter(!is.na(county_name)) %>% 
+    summarise_hhs(county_name) %>% 
+    mutate(type = "county_hhs")
+  
+  bind_rows(
+    data_state_hhs,
+    data_city_hhs,
+    data_county_hhs
+  ) %>% 
+    mutate(seed = seed)
+}
+
+data_hhs <- seq_len(ITERATIONS) %>%
+  future_map_dfr(
+    .f = prep_hhs,
+    .data = filter(ipums_clean, is_renter)
+  )
+
+data_hhs_mean <- data_hhs %>% 
+  select(-seed) %>% 
+  group_by(city, state, county_name, type) %>% 
+  summarise_all(mean) %>% 
+  ungroup() %>% 
+  add_moe()
+
+data_state_hhs <- data_hhs_mean %>% 
+  filter(type == "state_hhs") %>% 
+  select(starts_with("renter")) %>% 
+  rename_with(~str_c("nys_", .))
+  
+
+hhs_nys_calc <- function(.data) {
+  .data %>% 
+    mutate(
+    renter_hhs_pct_est = renter_hhs_num_est / nys_renter_hhs_num_est, 
+    renter_hhs_pct_moe_90 = tidycensus::moe_prop(
+      renter_hhs_num_est, nys_renter_hhs_num_est, 
+      renter_hhs_num_moe_90, nys_renter_hhs_num_moe_90
+    ),
+    renter_hhs_lost_wages_pct_est = renter_hhs_lost_wages_num_est / nys_renter_hhs_lost_wages_num_est, 
+    renter_hhs_lost_wages_pct_moe_90 = tidycensus::moe_prop(
+      renter_hhs_lost_wages_num_est, nys_renter_hhs_lost_wages_num_est, 
+      renter_hhs_lost_wages_num_moe_90, nys_renter_hhs_lost_wages_num_moe_90
+    ),
+    renter_need_ui300_pct_est = renter_need_ui300_num_est / nys_renter_need_ui300_num_est, 
+    renter_need_ui300_pct_moe_90 = tidycensus::moe_prop(
+      renter_need_ui300_num_est, nys_renter_need_ui300_num_est, 
+      renter_need_ui300_num_moe_90, nys_renter_need_ui300_num_moe_90
+    )
+  )
+}
+
+data_city_hhs <- data_hhs_mean %>% 
+  filter(type == "city_hhs") %>% 
+  bind_cols(data_state_hhs) %>% 
+  hhs_nys_calc() %>% 
+  mutate(
+    type = "City",
+    geo = city
+  ) %>% 
+  select(
+    type, geo,
+    starts_with("renter_hhs_"), 
+    starts_with("renter_hhs_lost_wages_"), 
+    starts_with("renter_need_ui300_")
+  )
+
+data_county_hhs <- data_hhs_mean %>% 
+  filter(type == "county_hhs") %>% 
+  bind_cols(data_state_hhs) %>% 
+  hhs_nys_calc() %>% 
+  mutate(
+    type = "County",
+    geo = county_name
+  ) %>% 
+  select(
+    type, geo,
+    starts_with("renter_hhs_"), 
+    starts_with("renter_hhs_lost_wages_"), 
+    starts_with("renter_need_ui300_")
+  )
+
+all_hhs_table <- bind_rows(
+  data_city_hhs, 
+  data_county_hhs,
+  data_state_hhs %>% 
+    rename_with(~str_remove(., "^nys_")) %>%
+    mutate(type = "State", geo = "New York State")
+)
+```
+
+```{r}
+summary_table <- left_join(all_pop_table, all_hhs_table, by = c("type", "geo"))
+```
+
+```{r}
+table_abs <- summary_table %>% select(type, geo, contains("num"))
+
+table_abs %>% 
+  gt(rowname_col = "geo",
+     groupname_col = "type") %>% 
+  tab_spanner("Total Population", starts_with("pop_num")) %>% 
+  tab_spanner("Renter Households", starts_with("renter_hhs_num")) %>% 
+  tab_spanner(md("Renter Households<br>with Lost Wages"), starts_with("renter_hhs_lost_wages_num")) %>% 
+  tab_spanner(md("Monthly Amount of Rental Assistance Need<br>(after Standard UI + $300/week)"), starts_with("renter_need_ui300_num")) %>% 
+  tab_spanner(md("Allocation of Direct<br>Federal Emergency Rental Assistance<br>(45% of locality's share of state population)"), starts_with("era_funds_num")) %>% 
+  cols_label(.list = hide_cols_list(table_abs)) %>%
+  hide_moe_cols(HIDE_MOE) %>%  
+  # highlight_total() %>%
+  fmt_number(everything(), suffixing = TRUE, decimals = 0) %>% 
+  fmt_number(ends_with("moe_90"), suffixing = TRUE, decimals = 0, pattern = "(+/- {x})") %>% 
+  fmt_currency(contains("(funds)|(ui300)_num"), suffixing = TRUE, decimals = 0) %>% 
+  fmt_currency(ends_with("_(funds)|(ui300)_num_moe_90"), suffixing = TRUE, decimals = 0, pattern = "(+/- {x})") %>% 
+  tab_header(
+    "Estimated absolute numbers by largest NY cities and counties",
+  ) %>% 
+  tab_source_note("Unemployment estimates use change between Nov 2019 and Nov 2020 by industry for NYS")
+
+```
+
+```{r}
+table_pct <- summary_table %>% 
+  select(type, geo, contains("pct")) %>% 
+  filter(type != "state") %>% 
+  mutate(direct_share = pop_pct_est * 0.45, .before = 1) %>% 
+  select(-contains("wages"))
+
+gt_table_pct <- table_pct %>%
+  gt(rowname_col = "geo",
+     groupname_col = "type") %>% 
+  tab_spanner("Share of Total NYS Aid Direct from Fed Gov't", 
+              starts_with("direct_share")) %>% 
+  tab_spanner("Share of NYS Population", 
+              starts_with("pop_pct")) %>% 
+  tab_spanner("Share of NYS Renter Households", 
+              starts_with("renter_hhs_pct")) %>% 
+  # tab_spanner(md("Share of NYS Renter Households with Lost Wages"), 
+  #             starts_with("renter_hhs_lost_wages_pct")) %>% 
+  tab_spanner(md("Share of Estimated Need¹"), 
+              starts_with("renter_need_ui300_pct")) %>% 
+  cols_label(.list = hide_cols_list(table_pct)) %>%
+  hide_moe_cols(HIDE_MOE) %>%  
+  # highlight_total() %>%
+  fmt_percent(everything(), decimals = 1) %>% 
+  fmt_percent(ends_with("moe_90"), decimals = 1, pattern = "(+/- {x})") %>% 
+  tab_header(
+    "Estimated local share of statewide totals for largest NY cities and counties",
+  ) %>% 
+  tab_source_note(
+    md("_Sources: US Census American Community Survey 2019 via IPUMS USA, US Bureau of Labor Statistics (BLS) Current Employment Statistics (CES)_")
+    ) %>% 
+  tab_source_note(
+    md("¹Unemployment estimates use change between Nov 2019 and Nov 2020 by industry for NYS. For more details on methodology for estimated rental assistance need, see our [previous blog post](https://furmancenter.org/thestoop/entry/rental-assistance-need-in-five-of-new-yorks-mid-sized-cities)")
+  )
+
+gt_table_pct
+```
